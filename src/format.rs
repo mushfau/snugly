@@ -24,6 +24,8 @@ pub const CODEC_ZSTD: u8 = 1;
 pub const CODEC_XZ: u8 = 2;
 pub const CODEC_XZ_X86: u8 = 3;
 pub const CODEC_BSC: u8 = 4;
+/// LZMA2 with the ARM64 branch filter (xz 5.4+), for Apple Silicon and other arm64 code.
+pub const CODEC_XZ_ARM64: u8 = 5;
 
 pub const E_FILE: u8 = 0;
 pub const E_DIR: u8 = 1;
@@ -124,12 +126,50 @@ pub struct Snapshot {
     pub entries: Vec<Entry>,
 }
 
+/// How files are cut into chunks. Recorded in the archive so a later snugly with different
+/// defaults keeps cutting the same way when it adds snapshots, and dedup keeps working.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Chunker {
+    /// 1 = FastCDC (2020 paper, `fastcdc::v2020`), normalization level 1.
+    pub algorithm: u8,
+    pub min: u32,
+    pub avg: u32,
+    pub max: u32,
+    /// Files up to this size are stored as a single chunk.
+    pub whole_file: u32,
+}
+
+impl Default for Chunker {
+    fn default() -> Self {
+        Chunker { algorithm: 1, min: 16 * 1024, avg: 64 * 1024, max: 256 * 1024, whole_file: 32 * 1024 }
+    }
+}
+
+impl Chunker {
+    fn valid(&self) -> bool {
+        // The bounds fastcdc accepts (it panics outside them), plus sane ordering.
+        self.algorithm == 1
+            && (64..=1 << 20).contains(&self.min)
+            && (256..=4 << 20).contains(&self.avg)
+            && (1024..=16 << 20).contains(&self.max)
+            && self.min <= self.avg
+            && self.avg <= self.max
+            && self.whole_file <= 16 << 20
+    }
+}
+
 #[derive(Default)]
 pub struct Index {
     pub blocks: Vec<BlockEntry>,
     pub chunks: Vec<ChunkEntry>,
     pub snapshots: Vec<Snapshot>,
+    /// Absent from archives written before it was recorded; those used the defaults.
+    pub chunker: Chunker,
 }
+
+/// Optional tagged sections after the snapshots: tag, length, payload. Readers skip tags they
+/// don't know, so new fields can be added without breaking older archives or readers.
+const SECTION_CHUNKER: u64 = 1;
 
 pub fn put_varint(out: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
@@ -273,6 +313,14 @@ impl Index {
                 encode_entry(&mut o, e);
             }
         }
+        let mut c = Vec::new();
+        c.push(self.chunker.algorithm);
+        for v in [self.chunker.min, self.chunker.avg, self.chunker.max, self.chunker.whole_file] {
+            put_varint(&mut c, v as u64);
+        }
+        put_varint(&mut o, SECTION_CHUNKER);
+        put_varint(&mut o, c.len() as u64);
+        o.extend_from_slice(&c);
         o
     }
 
@@ -286,7 +334,7 @@ impl Index {
             let comp_len = get_varint(buf, &mut p)?;
             let raw_len = get_varint(buf, &mut p)?;
             let codec = get_u8(buf, &mut p)?;
-            if codec > CODEC_BSC {
+            if codec > CODEC_XZ_ARM64 {
                 bail!("unknown codec {codec}");
             }
             if raw_len > 1 << 31 || comp_len > 1 << 32 {
@@ -320,10 +368,26 @@ impl Index {
             }
             snapshots.push(Snapshot { time_s, label, first_block, entries });
         }
-        if p != buf.len() {
-            bail!("trailing bytes in index");
+        let mut chunker = Chunker::default();
+        while p < buf.len() {
+            let tag = get_varint(buf, &mut p)?;
+            let len = get_varint(buf, &mut p)? as usize;
+            let body = buf.get(p..p.checked_add(len).context("overflow")?).context("truncated section")?;
+            p += len;
+            if tag == SECTION_CHUNKER {
+                let mut q = 0;
+                let algorithm = get_u8(body, &mut q)?;
+                let mut v = [0u32; 4];
+                for x in &mut v {
+                    *x = u32::try_from(get_varint(body, &mut q)?).context("bad chunker settings")?;
+                }
+                chunker = Chunker { algorithm, min: v[0], avg: v[1], max: v[2], whole_file: v[3] };
+                if !chunker.valid() {
+                    bail!("unsupported chunker settings {chunker:?}");
+                }
+            }
         }
-        Ok(Index { blocks, chunks, snapshots })
+        Ok(Index { blocks, chunks, snapshots, chunker })
     }
 }
 

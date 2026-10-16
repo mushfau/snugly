@@ -5,7 +5,7 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let Some((&sel, rest)) = data.split_first() else { return };
-    let codec = sel % 5;
+    let codec = sel % 6;
     if codec == snugly::format::CODEC_BSC {
         let mut b = rest.to_vec();
         if let Some(raw) = snugly::bsc::fuzz_seal(&mut b, 1 << 22) {

@@ -18,7 +18,8 @@ Anyone can reproduce this one: `python3 bench/fetch-corpus.py` downloads the sam
 |---|---|---|---|---|
 | Before speed work | 636.0 MB | 295 s | 555 s | 25 s |
 | Faster recompression and threading | 636.0 MB | 240 s | 449 s | 25 s |
-| **Current (adds libbsc)** | **632.7 MB** | **211 s** | **399 s** | 44 s |
+| Adds libbsc | 632.7 MB | 211 s | 399 s | 44 s |
+| **Current (adds ARM64/x86 filters for programs)** | **622.5 MB** | **218 s** | **423 s** | 43 s |
 
 Peak memory is about 2.2 GB when creating and 1.9 GB when extracting.
 
@@ -28,9 +29,11 @@ What changed:
 - The thread count now defaults to all cores, limited by memory, instead of at most 4.
 - Blocks where a sample shows [libbsc](https://github.com/IlyaGrebnov/libbsc)'s Burrows–Wheeler coder at least 3% smaller than zstd now use it. Here that was 3 of 13 blocks: together they came out 3.3 MB (9%) smaller and compressed up to 4x faster. One of the three, a block that compresses to almost nothing either way, ended up 0.1 MB larger because the sample misjudged it. They decode more slowly, which is why extraction went from 25 s to 44 s. libbsc was hardened before use: fuzzing found five out-of-bounds bugs in its decoder, all fixed (see `vendor/README.md`).
 
+- Programs are now grouped by processor, read from their Mach-O, ELF or PE headers, and compressed with LZMA2 behind the matching branch filter whenever a sample shows it at least 3% smaller than zstd. The test set's 184 MB of macOS, Linux and Windows programs came out 26% smaller (54.2 MB to 40.2 MB). On Apple Silicon's `deno` binary, zstd -19 gives 35.9% of the original size, LZMA2 alone 30.6%, and LZMA2 with the ARM64 filter 25.2%.
+
 Where libbsc wins, it wins big. On a 119 MB block of prose and XML from Silesia, it produced 15.6 MB against zstd -19's 18.7 MB (17% smaller) in 6.7 s instead of 71 s. On source code, where zstd's long-range matching finds repeats across files, zstd stays smaller, so snugly keeps using it.
 
-`--stats` shows where the time goes. Most of the CPU time is now zstd level 19 on code and executables, then JPEG and deflate recompression.
+`--stats` shows where the time goes. Most of the CPU time is now zstd level 19 on source code and binary data, LZMA2 on programs, then JPEG and deflate recompression.
 
 ## Photos
 

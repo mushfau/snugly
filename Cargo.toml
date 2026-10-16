@@ -23,7 +23,7 @@ rayon = "1.12.0"
 reed-solomon-simd = "3.1.0"
 rpassword = "7.5.4"
 walkdir = "2.5.0"
-xz2 = "0.1"
+liblzma = { version = "0.4.8", default-features = false, features = ["static"] }
 zeroize = "1.9.1"
 zstd = { version = "0.14.2", features = ["zstdmt"] }
 

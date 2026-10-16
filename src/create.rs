@@ -32,8 +32,6 @@ const STREAM_THRESHOLD: u64 = 64 << 20;
 const RECOMP_LIMIT: u64 = 256 << 20;
 const BATCH_BYTES: u64 = 32 << 20;
 const BATCH_FILES: usize = 512;
-const CDC: (usize, usize, usize) = (16 * 1024, 64 * 1024, 256 * 1024);
-const SMALL_FILE: usize = 32 * 1024;
 
 pub struct Opts {
     pub mode: Mode,
@@ -127,6 +125,7 @@ struct Builder {
     open: HashMap<Kind, (u32, Vec<u8>)>,
     next_block: u32,
     tx: mpsc::SyncSender<Job>,
+    cdc: Chunker,
     /// Blocks sent but not yet picked up by a compression thread.
     pending: Arc<std::sync::atomic::AtomicUsize>,
     dup_bytes: u64,
@@ -165,10 +164,11 @@ impl Builder {
         if data.is_empty() {
             return Ok(vec![]);
         }
-        if data.len() <= SMALL_FILE {
+        let c = self.cdc;
+        if data.len() <= c.whole_file as usize {
             return Ok(vec![self.add_chunk(kind, data)?]);
         }
-        fastcdc::v2020::FastCDC::new(data, CDC.0, CDC.1, CDC.2)
+        fastcdc::v2020::FastCDC::new(data, c.min as usize, c.avg as usize, c.max as usize)
             .map(|c| self.add_chunk(kind, &data[c.offset..c.offset + c.length]))
             .collect()
     }
@@ -333,7 +333,17 @@ pub fn create(archive: &Path, input: &Path, o: &Opts) -> Result<()> {
 
     // 2. Group: kind, then path within the top-level folder.
     let tail = |r: &str| r.split_once('/').map(|x| x.1.to_string()).unwrap_or_else(|| r.to_string());
-    items.sort_by_cached_key(|f| (f.kind, tail(&f.rel), f.rel.clone()));
+    // Executables first: their blocks use the slowest codec (LZMA2, single-threaded per block),
+    // so starting them early lets them overlap with everything else instead of running alone
+    // at the end.
+    let order = |k: Kind| match k {
+        Kind::ExecutableArm64 => 0,
+        Kind::Executable => 1,
+        Kind::Text => 2,
+        Kind::Binary => 3,
+        Kind::Incompressible => 4,
+    };
+    items.sort_by_cached_key(|f| (order(f.kind), tail(&f.rel), f.rel.clone()));
 
     // 3. Compression workers (compress, then seal if encrypted) and the writer.
     let plan = plan_threads(o, &items, block_size);
@@ -390,10 +400,10 @@ pub fn create(archive: &Path, input: &Path, o: &Opts) -> Result<()> {
         .collect();
     drop(wtx);
     let mut bw = BufWriter::with_capacity(1 << 20, out.try_clone()?);
-    let writer = thread::spawn(move || -> Result<(u64, Vec<(u32, BlockEntry)>, [usize; 5])> {
+    let writer = thread::spawn(move || -> Result<(u64, Vec<(u32, BlockEntry)>, [usize; 6])> {
         let mut off = start;
         let mut blocks = Vec::new();
-        let mut codec_count = [0usize; 5];
+        let mut codec_count = [0usize; 6];
         for r in wrx {
             let (id, raw_len, codec, bytes) = r?;
             let t = Instant::now();
@@ -415,6 +425,8 @@ pub fn create(archive: &Path, input: &Path, o: &Opts) -> Result<()> {
         open: HashMap::new(),
         next_block: first_block,
         tx,
+        // Existing archives keep the chunker they were made with, so dedup still matches.
+        cdc: index.chunker,
         pending: Arc::clone(&pending),
         dup_bytes: 0,
     };
@@ -429,7 +441,8 @@ pub fn create(archive: &Path, input: &Path, o: &Opts) -> Result<()> {
                 let f = File::open(&it.abs).with_context(|| format!("reading {}", it.abs.display()))?;
                 let mut hasher = blake3::Hasher::new();
                 let (mut refs, mut size) = (Vec::new(), 0u64);
-                for c in fastcdc::v2020::StreamCDC::new(BufReader::with_capacity(1 << 20, f), CDC.0, CDC.1, CDC.2) {
+                let cdc = b.cdc;
+                for c in fastcdc::v2020::StreamCDC::new(BufReader::with_capacity(1 << 20, f), cdc.min as usize, cdc.avg as usize, cdc.max as usize) {
                     let c = c.map_err(|e| anyhow::anyhow!("chunking {}: {e:?}", it.abs.display()))?;
                     hasher.update(&c.data);
                     size += c.length as u64;
@@ -514,7 +527,7 @@ pub fn create(archive: &Path, input: &Path, o: &Opts) -> Result<()> {
     let [_, gz, jp, sp] = rstats;
     eprintln!(
         "snapshot #{} {}: {nfiles} files ({}){} | unchanged {reused} ({}) reused without reading | read {} | \
-         dedup matched {} | recompressed {} gzip, {} jpeg, {} zip/png | streamed {streamed} | +{} new blocks [store {} zstd {} bsc {} xz {} xz+bcj {}] | \
+         dedup matched {} | recompressed {} gzip, {} jpeg, {} zip/png | streamed {streamed} | +{} new blocks [store {} zstd {} bsc {} xz {} xz+x86 {} xz+arm64 {}] | \
          added {} -> archive now {} | {:.2}s",
         index.snapshots.len(),
         if cipher.is_some() { "(encrypted)" } else { "" },
@@ -525,7 +538,7 @@ pub fn create(archive: &Path, input: &Path, o: &Opts) -> Result<()> {
         human(dup_bytes),
         gz.0, jp.0, sp.0,
         index.blocks.len() - first_block as usize,
-        codec_count[0], codec_count[1], codec_count[4], codec_count[2], codec_count[3],
+        codec_count[0], codec_count[1], codec_count[4], codec_count[2], codec_count[3], codec_count[5],
         human(total - start),
         human(total),
         t0.elapsed().as_secs_f64()
@@ -570,6 +583,8 @@ fn plan_threads(o: &Opts, items: &[Item], block_size: usize) -> ThreadPlan {
     let per_block: u64 = block_size as u64
         + match o.mode {
             Mode::Fast => 64 << 20,
+            // LZMA2 on executable blocks needs ~11.5x its 128 MiB dictionary.
+            Mode::Balanced if per_kind.keys().any(|k| matches!(k, Kind::Executable | Kind::ExecutableArm64)) => 1600 << 20,
             Mode::Balanced => 900 << 20,
             Mode::Max | Mode::Exhaustive => 2400 << 20,
         };

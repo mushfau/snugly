@@ -59,7 +59,7 @@ pub fn group_of(ext: &str, kind: crate::codec::Kind, magic_jpeg: bool, magic_png
         _ if magic_zip => 7,
         "gz" | "tgz" | "bz2" | "xz" | "zst" | "7z" | "rar" | "lz4" | "br" | "dmg" => 8,
         _ => match kind {
-            Kind::Executable => 9,
+            Kind::Executable | Kind::ExecutableArm64 => 9,
             Kind::Text => 10,
             _ => 11,
         },
@@ -78,7 +78,7 @@ pub struct Stats {
     pub queue_wait: Counter,
     pub probe: Counter,
     /// Block compression by kind (text, binary, executable, incompressible).
-    pub compress: [Counter; 4],
+    pub compress: [Counter; 5],
     pub seal: Counter,
     pub write: Counter,
     pub index: Counter,
@@ -98,7 +98,7 @@ pub static S: Stats = Stats {
     chunk: Counter::new(),
     queue_wait: Counter::new(),
     probe: Counter::new(),
-    compress: [Counter::new(), Counter::new(), Counter::new(), Counter::new()],
+    compress: [Counter::new(), Counter::new(), Counter::new(), Counter::new(), Counter::new()],
     seal: Counter::new(),
     write: Counter::new(),
     index: Counter::new(),
@@ -140,6 +140,7 @@ pub fn print(wall: f64, blocks: usize, inner: u32, workers: usize) {
     row("compress binary blocks", &S.compress[1]);
     row("compress executable blocks", &S.compress[2]);
     row("compress media blocks", &S.compress[3]);
+    row("compress arm64 code blocks", &S.compress[4]);
     row("encrypt", &S.seal);
     row("write", &S.write);
     row("index + footer", &S.index);
@@ -148,7 +149,7 @@ pub fn print(wall: f64, blocks: usize, inner: u32, workers: usize) {
     let mut blocks = BLOCKS.lock().unwrap().clone();
     blocks.sort_by_key(|b| b.0);
     if !blocks.is_empty() {
-        const KINDS: [&str; 4] = ["text", "binary", "executable", "media"];
+        const KINDS: [&str; 5] = ["text", "binary", "executable", "media", "arm64 code"];
         eprintln!();
         eprintln!("blocks");
         eprintln!("  {:>5} {:<11} {:>10} {:>10} {:>8} {:>9}", "id", "kind", "raw MB", "out MB", "workers", "seconds");

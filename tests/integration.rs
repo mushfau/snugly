@@ -397,6 +397,7 @@ fn hostile_paths_are_rejected() {
             blocks: vec![BlockEntry { offset: off, comp_len: payload.len() as u64, raw_len: payload.len() as u64, codec: CODEC_STORE }],
             chunks: vec![ChunkEntry { block: 0, offset: 0, len: payload.len() as u64, hash: *blake3::hash(&payload).as_bytes() }],
             snapshots: vec![Snapshot { time_s: 0, label: "evil".into(), first_block: 0, entries: vec![entry] }],
+            chunker: Default::default(),
         };
         let raw = idx.encode();
         let comp = zstd::bulk::compress(&raw, 3).unwrap();
@@ -442,4 +443,23 @@ fn corrupted_archives_fail_cleanly_never_panic() {
         let err = String::from_utf8_lossy(&o.stderr);
         assert!(!err.contains("panicked") && o.status.code() != Some(101), "case {i} panicked:\n{err}");
     }
+}
+
+#[test]
+fn chunker_settings_are_recorded_and_old_indexes_still_read() {
+    use snugly::format::*;
+    // A new index carries the chunker section and reads back identically.
+    let idx = Index { chunker: Chunker { avg: 32 * 1024, ..Default::default() }, ..Default::default() };
+    let raw = idx.encode();
+    assert_eq!(Index::decode(&raw).unwrap().chunker, idx.chunker);
+    // An index written before the section existed (blocks, chunks, snapshots only) still decodes,
+    // with the defaults those archives were made with.
+    let old = [0u8, 0, 0];
+    assert_eq!(Index::decode(&old).unwrap().chunker, Chunker::default());
+    // Unknown sections are skipped; nonsense chunker settings are refused instead of panicking.
+    let mut future = raw.clone();
+    future.extend_from_slice(&[99, 3, 1, 2, 3]);
+    assert!(Index::decode(&future).is_ok());
+    let bad = Index { chunker: Chunker { min: 1, ..Default::default() }, ..Default::default() }.encode();
+    assert!(Index::decode(&bad).is_err());
 }
