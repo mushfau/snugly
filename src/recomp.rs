@@ -59,8 +59,15 @@ fn gzip_header_len(d: &[u8]) -> Option<usize> {
 /// Layout: [plain text of every member, concatenated] [meta] [meta_len: u32 LE]
 /// meta = n_members, per member {hdr, corrections, 8-byte trailer, plain_len}, trailing garbage.
 /// Plain text goes first so the classifier and the solid compressor see it as ordinary data.
-pub fn gzip_forward(d: &[u8]) -> Option<Vec<u8>> {
-    let cfg = preflate_rs::PreflateConfig::default();
+/// preflate settings. snugly always rebuilds every recompressed file and compares it with the
+/// original, so preflate's own internal verification is redundant on the fast path; it is
+/// switched on only for the careful retry after an end-to-end mismatch.
+pub fn preflate_config(careful: bool) -> preflate_rs::PreflateConfig {
+    preflate_rs::PreflateConfig { verify_compression: careful, ..Default::default() }
+}
+
+pub fn gzip_forward(d: &[u8], careful: bool) -> Option<Vec<u8>> {
+    let cfg = preflate_config(careful);
     let mut plain_all = Vec::new();
     let mut meta = Vec::new();
     let mut members = 0u64;
@@ -131,13 +138,22 @@ fn gzip_inverse(t: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-pub fn jpeg_forward(d: &[u8]) -> Option<Vec<u8>> {
-    use lepton_jpeg::{encode_lepton_verify, EnabledFeatures, DEFAULT_THREAD_POOL};
+/// Lepton-encode a JPEG. The output is the same whichever thread pool is used. The end-to-end
+/// check in `forward` decodes the result anyway, so lepton's own verify pass (a second full
+/// decode) is skipped unless `careful`.
+pub fn jpeg_forward(d: &[u8], careful: bool) -> Option<Vec<u8>> {
+    use lepton_jpeg::{encode_lepton, encode_lepton_verify, EnabledFeatures, DEFAULT_THREAD_POOL};
+    let feats = EnabledFeatures::compat_lepton_vector_write();
     let r = std::panic::catch_unwind(|| {
-        encode_lepton_verify(d, &EnabledFeatures::compat_lepton_vector_write(), &DEFAULT_THREAD_POOL)
+        if careful {
+            encode_lepton_verify(d, &feats, &DEFAULT_THREAD_POOL).map(|(v, _)| v)
+        } else {
+            let mut out = Cursor::new(Vec::with_capacity(d.len()));
+            encode_lepton(&mut Cursor::new(d), &mut out, &feats, &DEFAULT_THREAD_POOL).map(|_| out.into_inner())
+        }
     });
     match r {
-        Ok(Ok((v, _))) => Some(v),
+        Ok(Ok(v)) => Some(v),
         _ => None,
     }
 }
@@ -172,19 +188,27 @@ fn inverse_inner(transform: u8, t: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
-/// Try every applicable transform; keep it only if the inverse reproduces `d` exactly.
-pub fn forward(d: &[u8]) -> Option<(u8, Vec<u8>)> {
-    let cand = if is_gzip(d) {
-        gzip_forward(d).map(|c| (T_GZIP, c))
+fn candidate(d: &[u8], careful: bool) -> Option<(u8, Vec<u8>)> {
+    if is_gzip(d) {
+        gzip_forward(d, careful).map(|c| (T_GZIP, c))
     } else if is_jpeg(d) {
-        jpeg_forward(d).map(|c| (T_JPEG, c))
+        jpeg_forward(d, careful).map(|c| (T_JPEG, c))
     } else if crate::splice::is_zip(d) || crate::splice::is_png(d) {
-        crate::splice::forward(d).map(|c| (T_SPLICE, c))
+        crate::splice::forward(d, careful).map(|c| (T_SPLICE, c))
     } else {
         None
-    }?;
-    match inverse(cand.0, &cand.1) {
-        Ok(r) if r == d => Some(cand),
-        _ => None,
     }
+}
+
+/// Try every applicable transform; keep it only if the inverse reproduces `d` exactly.
+/// The fast attempt relies on this end-to-end check alone. Only if it fails is the file tried
+/// again with the libraries' own per-stream verification, which can still save the streams
+/// that do rebuild.
+pub fn forward(d: &[u8]) -> Option<(u8, Vec<u8>)> {
+    let ok = |c: &(u8, Vec<u8>)| matches!(inverse(c.0, &c.1), Ok(r) if r == d);
+    let cand = candidate(d, false)?;
+    if ok(&cand) {
+        return Some(cand);
+    }
+    candidate(d, true).filter(ok)
 }

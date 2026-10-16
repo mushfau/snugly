@@ -5,3 +5,4 @@ target/
 bench-out/
 .DS_Store
 vendor/preflate-rs/.cargo-ok
+bench/corpus/

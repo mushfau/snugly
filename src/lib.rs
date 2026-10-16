@@ -10,3 +10,4 @@ pub mod format;
 pub mod recomp;
 pub mod recovery;
 pub mod splice;
+pub mod stats;

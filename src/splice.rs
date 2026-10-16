@@ -43,11 +43,11 @@ fn be32(d: &[u8], i: usize) -> Option<usize> {
 }
 
 /// Inflate one deflate stream with preflate; None unless it rebuilds exactly and cheaply.
-fn inflate(deflate: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+fn inflate(deflate: &[u8], careful: bool) -> Option<(Vec<u8>, Vec<u8>)> {
     if deflate.len() < 16 {
         return None;
     }
-    let cfg = preflate_rs::PreflateConfig::default();
+    let cfg = crate::recomp::preflate_config(careful);
     let r = std::panic::catch_unwind(|| preflate_rs::preflate_whole_deflate_stream(deflate, &cfg)).ok()?;
     let (res, plain) = r.ok()?;
     if res.compressed_size != deflate.len() || res.corrections.len() > deflate.len() / 2 {
@@ -118,7 +118,9 @@ fn png_idat_ranges(d: &[u8]) -> Option<Vec<(usize, usize)>> {
     (!out.is_empty()).then_some(out)
 }
 
-pub fn forward(d: &[u8]) -> Option<Vec<u8>> {
+/// `careful` makes preflate verify each stream itself, so one stream that can't be rebuilt
+/// is left in the skeleton instead of failing the whole file's end-to-end check.
+pub fn forward(d: &[u8], careful: bool) -> Option<Vec<u8>> {
     let (streams, pieces): (Vec<Stream>, Vec<(usize, usize)>) = if is_png(d) {
         let ranges = png_idat_ranges(d)?;
         let payload: Vec<u8> = ranges.iter().flat_map(|&(o, l)| &d[o..o + l]).copied().collect();
@@ -126,13 +128,13 @@ pub fn forward(d: &[u8]) -> Option<Vec<u8>> {
             return None;
         }
         let def = &payload[2..payload.len() - 4];
-        let (plain, corr) = inflate(def)?;
+        let (plain, corr) = inflate(def, careful)?;
         (vec![Stream { prefix: payload[..2].to_vec(), suffix: payload[payload.len() - 4..].to_vec(), plain, corr }], ranges)
     } else if is_zip(d) {
         let mut streams = Vec::new();
         let mut pieces = Vec::new();
         for (o, l) in zip_deflate_ranges(d)? {
-            if let Some((plain, corr)) = inflate(&d[o..o + l]) {
+            if let Some((plain, corr)) = inflate(&d[o..o + l], careful) {
                 streams.push(Stream { prefix: vec![], suffix: vec![], plain, corr });
                 pieces.push((o, l));
             }

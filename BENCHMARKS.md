@@ -10,6 +10,24 @@ These numbers were measured on pre-release builds while snugly was being develop
 
 **Tools compared:** zip, 7-Zip (LZMA2 9e, solid, "Ultra"), tar.xz and tar.zst. RAR was not tested, because its compressor is proprietary.
 
+## Public benchmark corpus, 1.08 GB, 11,272 files (VM)
+
+Anyone can reproduce this one: `python3 bench/fetch-corpus.py` downloads the same files, checked against their SHA-256 (see the README). It mixes camera photos (26%), executables (17%), text and source code (15%), video (13%), PDFs, Office files, PNGs, HEIC test images and the Silesia corpus. Balanced mode, 2 threads, files already in the disk cache.
+
+| Build | Archive | Create | CPU time | Peak memory |
+|---|---|---|---|---|
+| Before speed work | 636.0 MB | 295 s | 555 s | 1.9 GB |
+| **Current** | **636.0 MB** | **240 s** | **449 s** | 1.8 GB |
+
+Extracting and verifying every file takes 25 s.
+
+What changed:
+- Recompressed files used to be verified twice: once by lepton or preflate internally, then again by snugly's own byte-for-byte rebuild. Now only snugly's check runs, and the libraries' own checks are used only as a fallback when it fails. JPEG, ZIP/PNG and gzip recompression each got about twice as fast.
+- When there are fewer blocks than cores, zstd now uses spare cores inside a block. On a single-block folder of source code this cut the time from 50 s to 37 s with 2 threads, at a cost of about 0.1% in size. Large archives, where every core already has a block, are unaffected.
+- The thread count now defaults to all cores, limited by memory, instead of at most 4.
+
+`--stats` shows where the time goes. On this machine about three quarters of the CPU time is zstd level 19, and most of the rest is JPEG and deflate recompression.
+
 ## Photos
 
 ### Photo originals, 1.66 GB (Mac)

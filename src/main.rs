@@ -26,8 +26,13 @@ struct Cli {
     cmd: Cmd,
 }
 
+fn cores() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2)
+}
+
+/// Recovery data is computed a segment (128 MiB) per thread.
 fn default_threads() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).min(4)
+    cores().min(4)
 }
 
 /// Threads for decoding/recompressing files in parallel. Each thread can hold a whole
@@ -54,9 +59,10 @@ enum Cmd {
         /// Disable recompression of JPEG, gzip, ZIP/Office and PNG files
         #[arg(long)]
         no_recomp: bool,
-        /// Blocks compressed in parallel (each needs roughly 1-1.5 GB in max mode)
-        #[arg(short = 't', long, default_value_t = default_threads())]
-        threads: usize,
+        /// Threads to use [default: all cores, fewer if memory is short — max mode needs
+        /// about 1.5 GB per block being compressed]
+        #[arg(short = 't', long)]
+        threads: Option<usize>,
         /// Encrypt with a password (prompted, or SNUGLY_PASSWORD). Only when creating.
         #[arg(short, long)]
         encrypt: bool,
@@ -73,6 +79,9 @@ enum Cmd {
         /// An existing .rec file is refreshed automatically on --update.
         #[arg(short, long, value_name = "PERCENT")]
         recovery: Option<f64>,
+        /// Print time spent in each stage and a breakdown of the input by file type
+        #[arg(long)]
+        stats: bool,
     },
     /// Create or refresh recovery data (<archive>.rec) for an archive
     Protect {
@@ -131,16 +140,16 @@ enum Cmd {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::C { archive, input, mode, block_mib, no_recomp, threads, encrypt, update, rehash, label, recovery } => {
+        Cmd::C { archive, input, mode, block_mib, no_recomp, threads, encrypt, update, rehash, label, recovery, stats } => {
             let rec = recovery::sidecar_path(&archive);
             if !archive.exists() && rec.exists() {
                 std::fs::remove_file(&rec)?; // stale recovery file from an archive that no longer exists
             }
-            with_pool(default_workers(), || {
-                create::create(&archive, &input, &create::Opts { mode, block_mib, recomp: !no_recomp, threads, encrypt, update, rehash, label })
+            with_pool(threads.unwrap_or_else(cores), || {
+                create::create(&archive, &input, &create::Opts { mode, block_mib, recomp: !no_recomp, threads, encrypt, update, rehash, label, stats })
             })?;
             if recovery.is_some() || rec.exists() {
-                recovery::protect(&archive, recovery, threads)?;
+                recovery::protect(&archive, recovery, threads.unwrap_or_else(default_threads))?;
             }
             Ok(())
         }

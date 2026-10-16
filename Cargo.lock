@@ -845,6 +845,7 @@ dependencies = [
  "filetime",
  "flate2",
  "lepton_jpeg",
+ "libc",
  "preflate-rs",
  "rayon",
  "reed-solomon-simd",

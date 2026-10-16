@@ -8,6 +8,7 @@ repository = "https://github.com/mushfau/snugly"
 readme = "README.md"
 
 [dependencies]
+libc = "0.2"
 anyhow = "1.0.104"
 argon2 = "0.6.0"
 blake3 = "1.8.7"

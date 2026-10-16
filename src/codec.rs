@@ -56,12 +56,22 @@ pub fn classify(ext: &str, head: &[u8]) -> Kind {
     }
 }
 
-fn zstd_compress(data: &[u8], level: i32) -> Result<Vec<u8>> {
+/// `workers` > 1 splits the block into jobs compressed in parallel by zstd itself. Jobs overlap
+/// so each one still sees the data before it: on a 128 MiB text block, 32 MiB jobs with a
+/// 1/2-window overlap cost about 0.1% in size, 64 MiB jobs with 1/4 about 0.03%. Used only when
+/// there are fewer blocks than threads, so large archives are unaffected.
+fn zstd_compress(data: &[u8], level: i32, workers: u32) -> Result<Vec<u8>> {
     use zstd::zstd_safe::CParameter;
     let mut c = zstd::bulk::Compressor::new(level)?;
     let wlog = (64 - (data.len().max(1 << 16) as u64 - 1).leading_zeros()).clamp(17, 27);
     c.set_parameter(CParameter::WindowLog(wlog))?;
     c.set_parameter(CParameter::EnableLongDistanceMatching(true))?;
+    if workers > 1 && data.len() >= 16 << 20 {
+        let (job, overlap) = if workers > 2 { (32u32 << 20, 8) } else { (64 << 20, 7) };
+        c.set_parameter(CParameter::NbWorkers(workers))?;
+        c.set_parameter(CParameter::JobSize(job))?;
+        c.set_parameter(CParameter::OverlapSizeLog(overlap))?;
+    }
     Ok(c.compress(data)?)
 }
 
@@ -81,9 +91,9 @@ fn xz_compress(data: &[u8], x86: bool) -> Result<Vec<u8>> {
     Ok(enc.finish()?)
 }
 
-fn run_codec(codec: u8, data: &[u8]) -> Result<Vec<u8>> {
+fn run_codec(codec: u8, data: &[u8], workers: u32) -> Result<Vec<u8>> {
     match codec {
-        CODEC_ZSTD => zstd_compress(data, 22),
+        CODEC_ZSTD => zstd_compress(data, 22, workers),
         CODEC_XZ => xz_compress(data, false),
         CODEC_XZ_X86 => xz_compress(data, true),
         _ => unreachable!(),
@@ -129,10 +139,12 @@ fn sample_of(raw: &[u8]) -> Vec<u8> {
 }
 
 /// Pick the best codec for a raw block. Returns (codec, compressed bytes).
-pub fn compress_block(raw: &[u8], kind: Kind, mode: Mode) -> Result<(u8, Vec<u8>)> {
+/// `workers` is how many threads this block may use (see `zstd_compress`).
+pub fn compress_block(raw: &[u8], kind: Kind, mode: Mode, workers: u32) -> Result<(u8, Vec<u8>)> {
     // Cheap entropy check: if a fast pass over a few slices saves under 1%, the block is
     // random/encrypted/already-compressed — store it instead of grinding a slow codec over it.
     if mode != Mode::Fast && raw.len() > 4 << 20 {
+        let t = std::time::Instant::now();
         let probe: Vec<u8> = (0..8)
             .flat_map(|i| {
                 let s = i * (raw.len() / 8);
@@ -140,15 +152,17 @@ pub fn compress_block(raw: &[u8], kind: Kind, mode: Mode) -> Result<(u8, Vec<u8>
             })
             .copied()
             .collect();
-        if zstd::bulk::compress(&probe, 1)?.len() as f64 > probe.len() as f64 * 0.99 {
+        let incompressible = zstd::bulk::compress(&probe, 1)?.len() as f64 > probe.len() as f64 * 0.99;
+        crate::stats::S.probe.add(t, probe.len() as u64, 0);
+        if incompressible {
             return Ok((CODEC_STORE, raw.to_vec()));
         }
     }
     let best = match (mode, kind) {
         // Media is mostly incompressible, but containers (HEIC/MOV metadata, index tables) still
         // give LZMA a few percent, so only max/exhaustive spend the time on it.
-        (Mode::Fast | Mode::Balanced, Kind::Incompressible) | (Mode::Fast, _) => (CODEC_ZSTD, zstd_compress(raw, 3)?),
-        (Mode::Balanced, _) => (CODEC_ZSTD, zstd_compress(raw, 19)?),
+        (Mode::Fast | Mode::Balanced, Kind::Incompressible) | (Mode::Fast, _) => (CODEC_ZSTD, zstd_compress(raw, 3, workers)?),
+        (Mode::Balanced, _) => (CODEC_ZSTD, zstd_compress(raw, 19, workers)?),
         (Mode::Max | Mode::Exhaustive, k) => {
             let mut codecs = vec![CODEC_ZSTD, CODEC_XZ];
             if k == Kind::Executable {
@@ -159,7 +173,7 @@ pub fn compress_block(raw: &[u8], kind: Kind, mode: Mode) -> Result<(u8, Vec<u8>
                 // runner-up only if the sample can't separate them (within 1.5%).
                 let s = sample_of(raw);
                 let mut scored: Vec<(usize, u8)> =
-                    codecs.par_iter().map(|&c| Ok((run_codec(c, &s)?.len(), c))).collect::<Result<_>>()?;
+                    codecs.par_iter().map(|&c| Ok((run_codec(c, &s, 1)?.len(), c))).collect::<Result<_>>()?;
                 scored.sort();
                 codecs = scored
                     .iter()
@@ -169,7 +183,7 @@ pub fn compress_block(raw: &[u8], kind: Kind, mode: Mode) -> Result<(u8, Vec<u8>
             }
             codecs
                 .par_iter()
-                .map(|&c| Ok((c, run_codec(c, raw)?)))
+                .map(|&c| Ok((c, run_codec(c, raw, workers)?)))
                 .collect::<Result<Vec<_>>>()?
                 .into_iter()
                 .min_by_key(|(_, v)| v.len())

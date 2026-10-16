@@ -17,7 +17,9 @@ use crate::crypto::{read_password, Cipher, KdfParams};
 use crate::format::*;
 use crate::recomp;
 use anyhow::{bail, Context, Result};
+use crate::stats::{self, S};
 use rayon::prelude::*;
+use std::sync::atomic::Ordering::Relaxed;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -37,11 +39,14 @@ pub struct Opts {
     pub mode: Mode,
     pub block_mib: usize,
     pub recomp: bool,
-    pub threads: usize,
+    /// Total threads (None: all cores, limited by memory).
+    pub threads: Option<usize>,
     pub encrypt: bool,
     pub update: bool,
     pub rehash: bool,
     pub label: Option<String>,
+    /// Print per-stage timing and a byte census by file type.
+    pub stats: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -122,6 +127,8 @@ struct Builder {
     open: HashMap<Kind, (u32, Vec<u8>)>,
     next_block: u32,
     tx: mpsc::SyncSender<Job>,
+    /// Blocks sent but not yet picked up by a compression thread.
+    pending: Arc<std::sync::atomic::AtomicUsize>,
     dup_bytes: u64,
 }
 
@@ -138,7 +145,10 @@ impl Builder {
         };
         if full {
             if let Some((id, d)) = self.open.remove(&kind) {
+                let t = Instant::now();
+                self.pending.fetch_add(1, Relaxed);
                 self.tx.send((id, kind, d)).context("compression workers stopped")?;
+                S.queue_wait.add(t, 0, 0);
             }
             self.open.insert(kind, (self.next_block, Vec::with_capacity(self.block_size)));
             self.next_block += 1;
@@ -164,10 +174,15 @@ impl Builder {
     }
 
     fn finish(mut self) -> Result<(Vec<ChunkEntry>, u64)> {
+        // Largest first: it starts while the most threads are free, so it gets extra zstd
+        // workers instead of finishing last on one thread.
         let mut open: Vec<_> = self.open.drain().collect();
-        open.sort_by_key(|(_, (id, _))| *id);
+        open.sort_by_key(|(_, (id, d))| (std::cmp::Reverse(d.len()), *id));
         for (kind, (id, d)) in open {
+            let t = Instant::now();
+            self.pending.fetch_add(1, Relaxed);
             self.tx.send((id, kind, d)).context("compression workers stopped")?;
+            S.queue_wait.add(t, 0, 0);
         }
         Ok((self.chunks, self.dup_bytes))
     }
@@ -184,16 +199,38 @@ struct Prepared {
 }
 
 fn prepare(it: &Item) -> Result<Prepared> {
+    let t = Instant::now();
     let data = fs::read(&it.abs).with_context(|| format!("reading {}", it.abs.display()))?;
     let size = data.len() as u64;
+    S.read.add(t, size, 0);
+    let t = Instant::now();
     let hash = *blake3::hash(&data).as_bytes();
-    if it.magic != Magic::None {
-        if let Some((t, c)) = recomp::forward(&data) {
-            return Ok(Prepared { kind: it.kind, size, hash, transform: t, content: c });
+    S.file_hash.add(t, size, 0);
+    let p = if it.magic != Magic::None {
+        let t = Instant::now();
+        match recomp::forward(&data) {
+            Some((tr, c)) => {
+                S.recomp[tr as usize].add(t, size, c.len() as u64);
+                Prepared { kind: it.kind, size, hash, transform: tr, content: c }
+            }
+            None => {
+                S.recomp_failed.add(t, size, size);
+                Prepared { kind: Kind::Incompressible, size, hash, transform: 0, content: data }
+            }
         }
-        return Ok(Prepared { kind: Kind::Incompressible, size, hash, transform: 0, content: data });
-    }
-    Ok(Prepared { kind: it.kind, size, hash, transform: 0, content: data })
+    } else {
+        Prepared { kind: it.kind, size, hash, transform: 0, content: data }
+    };
+    census(it, size, p.content.len() as u64);
+    Ok(p)
+}
+
+fn census(it: &Item, size: u64, after: u64) {
+    let g = stats::group_of(&ext_of(&it.rel), it.kind, it.magic == Magic::Jpeg, it.magic == Magic::Png, it.magic == Magic::Zip);
+    let c = &S.groups[g];
+    c.n.fetch_add(1, Relaxed);
+    c.bytes_in.fetch_add(size, Relaxed);
+    c.bytes_out.fetch_add(after, Relaxed);
 }
 
 fn file_entry(rel: &str, meta: Meta, size: u64, hash: [u8; 32], transform: u8, chunks: Vec<u32>) -> Entry {
@@ -246,6 +283,7 @@ pub fn create(archive: &Path, input: &Path, o: &Opts) -> Result<()> {
         .unwrap_or_default();
 
     // 1. Walk.
+    let t_walk = Instant::now();
     let mut entries: Vec<Entry> = Vec::new();
     let mut paths = Vec::new();
     let (mut skipped, mut reused, mut reused_bytes) = (0usize, 0usize, 0u64);
@@ -291,13 +329,22 @@ pub fn create(archive: &Path, input: &Path, o: &Opts) -> Result<()> {
             Ok(Item { abs, rel, size, meta, kind, magic })
         })
         .collect::<Result<_>>()?;
+    S.walk.add(t_walk, 0, 0);
 
     // 2. Group: kind, then path within the top-level folder.
     let tail = |r: &str| r.split_once('/').map(|x| x.1.to_string()).unwrap_or_else(|| r.to_string());
     items.sort_by_cached_key(|f| (f.kind, tail(&f.rel), f.rel.clone()));
 
     // 3. Compression workers (compress, then seal if encrypted) and the writer.
-    let threads = o.threads.max(1);
+    let plan = plan_threads(o, &items, block_size);
+    let threads = plan.blocks;
+    let total_threads = plan.total;
+    // Blocks being compressed right now. A block that starts takes up to twice an even share of
+    // the threads as zstd workers (at most 4), so blocks that end up running alone don't leave
+    // cores idle. The 2x oversubscription is brief and is covered by the memory budget.
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let max_inner = Arc::new(std::sync::atomic::AtomicU32::new(1));
+    let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (tx, rx) = mpsc::sync_channel::<Job>(threads);
     let rx = Arc::new(Mutex::new(rx));
     let (wtx, wrx) = mpsc::channel::<Result<(u32, u64, u8, Vec<u8>)>>();
@@ -307,17 +354,34 @@ pub fn create(archive: &Path, input: &Path, o: &Opts) -> Result<()> {
             let rx = Arc::clone(&rx);
             let wtx = wtx.clone();
             let cipher = cipher.clone();
+            let active = Arc::clone(&active);
+            let max_inner = Arc::clone(&max_inner);
+            let pending = Arc::clone(&pending);
             thread::spawn(move || loop {
                 let job = rx.lock().unwrap().recv();
                 let Ok((id, kind, data)) = job else { break };
-                let r = compress_block(&data, kind, mode).and_then(|(c, b)| {
+                let now = active.fetch_add(1, Relaxed) + 1;
+                let backlog = pending.fetch_sub(1, Relaxed) > 1;
+                // With other blocks waiting, idle threads will pick those up instead.
+                let inner = if backlog { 1 } else { (2 * total_threads / now).min(total_threads).clamp(1, 4) as u32 };
+                max_inner.fetch_max(inner, Relaxed);
+                let t = Instant::now();
+                let r = compress_block(&data, kind, mode, inner).and_then(|(c, b)| {
+                    S.compress[kind as usize].add(t, data.len() as u64, b.len() as u64);
+                    stats::BLOCKS.lock().unwrap().push((id, kind as usize, data.len() as u64, b.len() as u64, inner, t.elapsed().as_secs_f64()));
                     let b = match &cipher {
-                        Some(k) => k.seal(ROLE_BLOCK, id as u64, &b)?,
+                        Some(k) => {
+                            let t = Instant::now();
+                            let sealed = k.seal(ROLE_BLOCK, id as u64, &b)?;
+                            S.seal.add(t, b.len() as u64, 0);
+                            sealed
+                        }
                         None => b,
                     };
                     Ok((id, data.len() as u64, c, b))
                 });
                 drop(data);
+                active.fetch_sub(1, Relaxed);
                 if wtx.send(r).is_err() {
                     break;
                 }
@@ -332,7 +396,9 @@ pub fn create(archive: &Path, input: &Path, o: &Opts) -> Result<()> {
         let mut codec_count = [0usize; 4];
         for r in wrx {
             let (id, raw_len, codec, bytes) = r?;
+            let t = Instant::now();
             bw.write_all(&bytes)?;
+            S.write.add(t, bytes.len() as u64, 0);
             blocks.push((id, BlockEntry { offset: off, comp_len: bytes.len() as u64, raw_len, codec }));
             codec_count[codec as usize] += 1;
             off += bytes.len() as u64;
@@ -349,6 +415,7 @@ pub fn create(archive: &Path, input: &Path, o: &Opts) -> Result<()> {
         open: HashMap::new(),
         next_block: first_block,
         tx,
+        pending: Arc::clone(&pending),
         dup_bytes: 0,
     };
     let (mut read_bytes, mut streamed) = (0u64, 0usize);
@@ -358,6 +425,7 @@ pub fn create(archive: &Path, input: &Path, o: &Opts) -> Result<()> {
         while i < items.len() {
             if items[i].streams() {
                 let it = &items[i];
+                let (t, w0) = (Instant::now(), S.queue_wait.ns.load(Relaxed));
                 let f = File::open(&it.abs).with_context(|| format!("reading {}", it.abs.display()))?;
                 let mut hasher = blake3::Hasher::new();
                 let (mut refs, mut size) = (Vec::new(), 0u64);
@@ -369,6 +437,8 @@ pub fn create(archive: &Path, input: &Path, o: &Opts) -> Result<()> {
                 }
                 read_bytes += size;
                 streamed += 1;
+                S.chunk.add_excluding(t, S.queue_wait.ns.load(Relaxed) - w0, size);
+                census(it, size, size);
                 entries.push(file_entry(&it.rel, it.meta.clone(), size, *hasher.finalize().as_bytes(), 0, refs));
                 i += 1;
                 continue;
@@ -385,7 +455,9 @@ pub fn create(archive: &Path, input: &Path, o: &Opts) -> Result<()> {
                 rs.0 += 1;
                 rs.1 += p.size;
                 rs.2 += p.content.len() as u64;
+                let (t, w0) = (Instant::now(), S.queue_wait.ns.load(Relaxed));
                 let refs = b.add_content(p.kind, &p.content)?;
+                S.chunk.add_excluding(t, S.queue_wait.ns.load(Relaxed) - w0, p.content.len() as u64);
                 entries.push(file_entry(&it.rel, it.meta.clone(), p.size, p.hash, p.transform, refs));
             }
             i = j;
@@ -412,6 +484,7 @@ pub fn create(archive: &Path, input: &Path, o: &Opts) -> Result<()> {
     }
 
     // 5. New index (all snapshots) + footer, appended after the new blocks.
+    let t_index = Instant::now();
     index.blocks.extend(new_blocks.into_iter().map(|(_, b)| b));
     index.chunks = chunks;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
@@ -432,6 +505,7 @@ pub fn create(archive: &Path, input: &Path, o: &Opts) -> Result<()> {
     tail.extend_from_slice(END_MAGIC);
     out.write_all(&tail)?;
     out.sync_all()?; // the new snapshot only counts once it's durably on disk
+    S.index.add(t_index, raw_idx.len() as u64, tail.len() as u64);
 
     let total = fs::metadata(archive)?.len();
     let snap = index.snapshots.last().unwrap();
@@ -457,7 +531,51 @@ pub fn create(archive: &Path, input: &Path, o: &Opts) -> Result<()> {
         t0.elapsed().as_secs_f64()
     );
     let _ = (gz.1, gz.2, jp.1, jp.2, sp.1, sp.2);
+    if o.stats {
+        stats::print(t0.elapsed().as_secs_f64(), threads, max_inner.load(Relaxed), rayon::current_num_threads());
+    }
     Ok(())
+}
+
+struct ThreadPlan {
+    /// Blocks compressed at the same time.
+    blocks: usize,
+    /// All threads available; spare ones become zstd workers inside blocks.
+    total: usize,
+}
+
+/// Physical memory in bytes, if the platform tells us.
+fn total_memory() -> Option<u64> {
+    #[cfg(unix)]
+    unsafe {
+        let pages = libc::sysconf(libc::_SC_PHYS_PAGES);
+        let size = libc::sysconf(libc::_SC_PAGESIZE);
+        if pages > 0 && size > 0 {
+            return Some(pages as u64 * size as u64);
+        }
+    }
+    None
+}
+
+/// Spread the threads over blocks first; when there are fewer blocks than threads, let zstd use
+/// the spare threads inside each block. The number of blocks in flight is also capped so their
+/// memory fits in half of RAM.
+fn plan_threads(o: &Opts, items: &[Item], block_size: usize) -> ThreadPlan {
+    let total = o.threads.unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2)).max(1);
+    let mut per_kind: HashMap<Kind, u64> = HashMap::new();
+    for it in items {
+        *per_kind.entry(it.kind).or_default() += it.size;
+    }
+    let expected: usize = per_kind.values().map(|&b| b.div_ceil(block_size as u64) as usize).sum::<usize>().max(1);
+    let per_block: u64 = block_size as u64
+        + match o.mode {
+            Mode::Fast => 64 << 20,
+            Mode::Balanced => 640 << 20,
+            Mode::Max | Mode::Exhaustive => 2400 << 20,
+        };
+    let mem_cap = total_memory().map(|m| ((m / 2) / per_block).max(1) as usize).unwrap_or(usize::MAX);
+    let blocks = total.min(expected).min(mem_cap).max(1);
+    ThreadPlan { blocks, total }
 }
 
 pub fn human(b: u64) -> String {

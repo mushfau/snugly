@@ -183,7 +183,7 @@ What happens to the bytes of an Office file and an edited copy of it:
 
 - **Archives only grow.** Each update adds a snapshot; deleting old snapshots to reclaim space isn't supported yet.
 - **Some file metadata isn't kept.** Extended attributes (on macOS: Finder tags, quarantine flags), ACLs and resource forks are not stored. Hard-linked files are restored as separate copies, though their data is only stored once.
-- **Memory in max mode.** LZMA2 uses about 1–1.3 GB per compression thread. On a small machine use `-t 1` or `-b 64`.
+- **Memory in max mode.** LZMA2 uses about 1–1.5 GB per block being compressed. snugly limits how many blocks it compresses at once to fit in half of your RAM; on a small machine you can also use `-t 1` or `-b 64`.
 - **Large photos need memory to restore.** Restoring a recompressed JPEG needs memory in proportion to its pixel count, up to about 4 GB for the largest image snugly accepts (16,386 × 16,386 pixels). Lower `-t` when extracting to limit how many are restored at once.
 
 ## Archive format (v1)
@@ -254,14 +254,25 @@ The higher memory limit is needed for `archive_verify` and `recomp_inverse`, bec
 
 Inputs that once caused a crash or hang are kept as regression tests in `tests/fuzz_regressions/`.
 
-To benchmark against zip and 7-Zip on your own files (macOS; install 7-Zip with `brew install sevenzip`):
+### Benchmark corpus
+
+`bench/fetch-corpus.py` downloads a fixed 1.2 GB set of public sample files (about 11,000 files): camera photos, HEIC/AVIF test images, sample videos, PDFs, Office files, PNGs, the Silesia corpus, open-source packages and macOS/Linux/Windows release binaries. Every file is checked against the SHA-256 in `bench/corpus.tsv`, and files already downloaded are reused, so you only download once.
 
 ```
+python3 bench/fetch-corpus.py              # into bench/corpus/ (ignored by git)
 cargo build --release
-./bench-local.sh ~/some/folder
+./target/release/snugly c /tmp/corpus.snug bench/corpus --stats
 ```
 
-It writes sizes, times and peak memory to `bench-out/results.txt`, without any file names.
+`--stats` prints the time spent in each stage (reading, hashing, recompression, chunking, compression, encryption, writing) and how much of the input each file type makes up.
+
+To compare against zip and 7-Zip (macOS; install 7-Zip with `brew install sevenzip`):
+
+```
+./bench-local.sh bench/corpus
+```
+
+It writes sizes, times and peak memory to `bench-out/results.txt`.
 
 ## License
 
