@@ -1,0 +1,7 @@
+target/
+/*.snug
+/*.snug.rec
+*-source.tar.gz
+bench-out/
+.DS_Store
+vendor/preflate-rs/.cargo-ok

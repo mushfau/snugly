@@ -1,0 +1,46 @@
+[package]
+name = "snugly-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+snugly = { path = ".." }
+
+[[bin]]
+name = "index_decode"
+path = "fuzz_targets/index_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recomp_inverse"
+path = "fuzz_targets/recomp_inverse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "archive_verify"
+path = "fuzz_targets/archive_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recovery_index"
+path = "fuzz_targets/recovery_index.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
+
+[patch.crates-io]
+preflate-rs = { path = "../vendor/preflate-rs" }

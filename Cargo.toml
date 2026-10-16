@@ -1,0 +1,34 @@
+[package]
+name = "snugly"
+version = "0.1.0"
+edition = "2024"
+description = "An archiver that packs files snugly: recompression, dedup, encryption, incremental snapshots and repair"
+license = "MIT"
+repository = "https://github.com/mushfau/snugly"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1.0.104"
+argon2 = "0.6.0"
+blake3 = "1.8.7"
+chacha20poly1305 = "0.11.0"
+clap = { version = "4.6.7", features = ["derive"] }
+fastcdc = "5.0.0"
+filetime = "0.2.29"
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
+lepton_jpeg = "0.5.8"
+preflate-rs = "0.7.6"
+rayon = "1.12.0"
+reed-solomon-simd = "3.1.0"
+rpassword = "7.5.4"
+walkdir = "2.5.0"
+xz2 = "0.1"
+zeroize = "1.9.1"
+zstd = { version = "0.14.2", features = ["zstdmt"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+# Local fix for an unbounded loop on corrupt input (found by fuzzing); see vendor/preflate-rs.
+[patch.crates-io]
+preflate-rs = { path = "vendor/preflate-rs" }
