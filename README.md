@@ -1,10 +1,24 @@
 # snugly
 
+[![CI](https://github.com/mushfau/snugly/actions/workflows/ci.yml/badge.svg)](https://github.com/mushfau/snugly/actions/workflows/ci.yml)
+
 **Packs your files snugly.** snugly is an archiver that makes smaller archives than ZIP and 7-Zip, and is usually much faster than 7-Zip's strongest setting. Besides compressing well, it losslessly recompresses JPEGs, gzip files, Office documents, ZIPs and PNGs, and stores repeated data only once. It also has password encryption, incremental snapshots and recovery data that can repair a damaged archive.
 
 > **Status:** early release. The archive format (v1) is now fixed: later versions of snugly will keep reading v1 archives, and new features are added through sections that older archives simply don't have. Every file is checked on every extract, but snugly is young, so keep other backups of anything important. Tested on macOS and Linux.
 
 ## Results
+
+The [public benchmark corpus](#benchmark-corpus): 1.16 GB, 11,272 files of photos, videos, PDFs, Office files, source code, programs and text that anyone can download and check. snugly in its default mode, the others at their strongest settings, 2 threads each:
+
+| Tool | Archive size | Time to create |
+|---|---|---|
+| zip -9 | 776.9 MB | 71 s |
+| tar + zstd -19 --long | 706.0 MB | 232 s |
+| tar + xz -9e | 697.6 MB | 429 s |
+| 7-Zip Ultra (LZMA2 9e) | 695.3 MB | 288 s |
+| **snugly** (default mode) | **622.5 MB** | **218 s** |
+
+That's 10.5% smaller than 7-Zip's strongest setting, and faster.
 
 A 1.66 GB folder of photo originals, on an Apple M5 Pro:
 
@@ -20,7 +34,11 @@ On a mix of Office files, JARs, ZIPs and PNGs, `snugly -m max` is **39% smaller 
 
 ## Install
 
-You need [Rust](https://rustup.rs) 1.85 or newer and a C/C++ compiler (snugly builds its bundled libbsc and xz from source): on macOS, `xcode-select --install`; on Debian/Ubuntu, `sudo apt install build-essential`; on Windows, the Visual Studio Build Tools.
+Download a ready-made build for macOS (Apple Silicon or Intel), Linux (x86-64 or ARM64) or Windows from the [releases page](https://github.com/mushfau/snugly/releases), unpack it, and put `snugly` somewhere on your PATH. Each download has a `.sha256` file to check it against.
+
+The macOS builds aren't signed with an Apple developer certificate, so the first time macOS will refuse to open them. Clear the download flag once with `xattr -d com.apple.quarantine snugly`.
+
+To build from source instead, you need [Rust](https://rustup.rs) 1.85 or newer and a C/C++ compiler (snugly builds its bundled libbsc and xz from source): on macOS, `xcode-select --install`; on Debian/Ubuntu, `sudo apt install build-essential`; on Windows, the Visual Studio Build Tools.
 
 ```
 git clone https://github.com/mushfau/snugly

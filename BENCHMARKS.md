@@ -23,6 +23,16 @@ Anyone can reproduce this one: `python3 bench/fetch-corpus.py` downloads the sam
 
 Peak memory is about 2.2 GB when creating and 1.9 GB when extracting.
 
+Other tools on the same files and machine, 2 threads each (7-Zip 24.09, xz 5.4, zstd 1.5.6):
+
+| Tool | Archive | Create |
+|---|---|---|
+| zip -9 | 776.9 MB | 71 s |
+| tar + zstd -19 --long=27 | 706.0 MB | 232 s |
+| tar + xz -9e | 697.6 MB | 429 s |
+| 7-Zip Ultra (`-mx=9 -ms=on`) | 695.3 MB | 288 s |
+| **snugly** (default mode) | **622.5 MB** | **218 s** |
+
 What changed:
 - Recompressed files used to be verified twice: once by lepton or preflate internally, then again by snugly's own byte-for-byte rebuild. Now only snugly's check runs, and the libraries' own checks are used only as a fallback when it fails. JPEG, ZIP/PNG and gzip recompression each got about twice as fast.
 - When there are fewer blocks than cores, zstd now uses spare cores inside a block. On a single-block folder of source code this cut the time from 50 s to 37 s with 2 threads, at a cost of about 0.1% in size. Large archives, where every core already has a block, are unaffected.
