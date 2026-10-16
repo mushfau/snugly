@@ -44,3 +44,10 @@ debug = 1
 
 [patch.crates-io]
 preflate-rs = { path = "../vendor/preflate-rs" }
+
+[[bin]]
+name = "block_decode"
+path = "fuzz_targets/block_decode.rs"
+test = false
+doc = false
+bench = false

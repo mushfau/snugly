@@ -23,6 +23,7 @@ pub const CODEC_STORE: u8 = 0;
 pub const CODEC_ZSTD: u8 = 1;
 pub const CODEC_XZ: u8 = 2;
 pub const CODEC_XZ_X86: u8 = 3;
+pub const CODEC_BSC: u8 = 4;
 
 pub const E_FILE: u8 = 0;
 pub const E_DIR: u8 = 1;
@@ -285,7 +286,7 @@ impl Index {
             let comp_len = get_varint(buf, &mut p)?;
             let raw_len = get_varint(buf, &mut p)?;
             let codec = get_u8(buf, &mut p)?;
-            if codec > CODEC_XZ_X86 {
+            if codec > CODEC_BSC {
                 bail!("unknown codec {codec}");
             }
             if raw_len > 1 << 31 || comp_len > 1 << 32 {

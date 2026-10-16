@@ -40,5 +40,62 @@ fn archive_whose_gzip_data_makes_preflate_panic() {
     std::fs::write(&path, fixture("archive_preflate_panic.snug")).unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_snugly")).args(["t", path.to_str().unwrap()]).output().unwrap();
     assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("corrupt data"));
+    // The archive has several damaged files; files are checked in parallel, so whichever
+    // error surfaces first is reported. All of them must be reported as corruption.
+    assert!(String::from_utf8_lossy(&out.stderr).contains("corrupt"), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn bsc_block_that_overreads_its_input() {
+    // A crafted bsc block made libbsc's range decoder read past the end of its input
+    // (found by fuzzing with AddressSanitizer). The patched decoder must reject it cleanly.
+    let d = fixture("bsc_range_coder_overread");
+    let mut b = d[1..].to_vec();
+    if let Some(raw) = snugly::bsc::fuzz_seal(&mut b, 1 << 22) {
+        assert!(snugly::codec::decompress(snugly::format::CODEC_BSC, b, raw).is_err());
+    }
+}
+
+#[test]
+fn bsc_block_whose_bwt_is_inconsistent() {
+    // libsais's optimised inverse BWT read out of bounds on this block (found by fuzzing with
+    // AddressSanitizer); snugly now inverts the BWT itself with bounds checks.
+    let d = fixture("bsc_unbwt_wild_read");
+    let mut b = d[1..].to_vec();
+    if let Some(raw) = snugly::bsc::fuzz_seal(&mut b, 1 << 22) {
+        assert!(snugly::codec::decompress(snugly::format::CODEC_BSC, b, raw).is_err());
+    }
+}
+
+#[test]
+fn bsc_block_with_an_escaped_rank_of_zero() {
+    // An escaped rank of 0 made libbsc's adaptive decoder index its context tables at -1
+    // (found by fuzzing with AddressSanitizer).
+    let d = fixture("bsc_rank_zero");
+    let mut b = d[1..].to_vec();
+    if let Some(raw) = snugly::bsc::fuzz_seal(&mut b, 1 << 22) {
+        assert!(snugly::codec::decompress(snugly::format::CODEC_BSC, b, raw).is_err());
+    }
+}
+
+#[test]
+fn bsc_block_with_a_rank_past_the_alphabet() {
+    // A decoded rank of 256 or more overflowed libbsc's move-to-front table on the stack
+    // (found by fuzzing with AddressSanitizer).
+    let d = fixture("bsc_rank_overflow");
+    let mut b = d[1..].to_vec();
+    if let Some(raw) = snugly::bsc::fuzz_seal(&mut b, 1 << 22) {
+        assert!(snugly::codec::decompress(snugly::format::CODEC_BSC, b, raw).is_err());
+    }
+}
+
+#[test]
+fn bsc_block_whose_rank_exponent_runs_away() {
+    // With a single-symbol alphabet the rank-exponent loop had no bound and walked off libbsc's
+    // model tables (found by fuzzing with AddressSanitizer).
+    let d = fixture("bsc_rank_exponent_runaway");
+    let mut b = d[1..].to_vec();
+    if let Some(raw) = snugly::bsc::fuzz_seal(&mut b, 1 << 22) {
+        assert!(snugly::codec::decompress(snugly::format::CODEC_BSC, b, raw).is_err());
+    }
 }

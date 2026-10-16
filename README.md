@@ -49,8 +49,8 @@ Pick one with `-m` when creating:
 | Mode | What it does | Use it for |
 |---|---|---|
 | `fast` | zstd level 3 | speed above all |
-| `balanced` (default) | zstd level 19 with long-range matching | everyday use |
-| `max` | picks zstd 22, LZMA2 or LZMA2 + x86 filter for each block | the smallest archive in reasonable time |
+| `balanced` (default) | zstd level 19 with long-range matching; libbsc for blocks where a sample shows it at least 3% smaller (typically prose, XML and databases) | everyday use |
+| `max` | picks zstd 22, LZMA2, LZMA2 + x86 filter or libbsc for each block | the smallest archive in reasonable time |
 | `exhaustive` | tries every codec on every block in full | squeezing out the last bit, slowly |
 
 Photos and other already-compressed media come out about the same in every mode, because most of their saving comes from recompression, which is always on.
@@ -94,6 +94,7 @@ The `.rec` file holds Reed–Solomon parity, like par2. With `-r 5` it can rebui
 - **Recompression.** JPEGs are re-encoded losslessly with [lepton](https://github.com/microsoft/lepton_jpeg_rust), typically about a quarter smaller. Deflate data inside gzip, ZIP, Office (docx/xlsx/pptx/odt), EPUB, JAR, APK, wheel and PNG files is unpacked with [preflate](https://github.com/microsoft/preflate-rs) so it compresses properly, then rebuilt bit for bit on extract. Every recompressed file is rebuilt and compared at archive time; anything that doesn't match exactly is stored as-is.
 - **Deduplication.** Files are cut into chunks at content-defined points and hashed with BLAKE3. A chunk that appears anywhere else, in this run or an earlier snapshot, is stored once. Moved, renamed and copied files cost almost nothing.
 - **Solid compression with fast access.** Similar files are grouped into 128 MiB blocks that compress together. Extracting one file only decodes the blocks it uses.
+- **The right codec per block.** Each block is compressed with zstd or, where a sample shows it clearly smaller, with [libbsc](https://github.com/IlyaGrebnov/libbsc)'s Burrows–Wheeler coder, which wins on prose, XML and database files. Executables get an x86 filter in max mode; already-compressed media is stored.
 - **Integrity.** Every file has a BLAKE3 hash that is checked on every extract and by `snugly t`.
 - **Metadata.** Permissions, nanosecond modification times (pre-1970 too), symlinks and empty folders are restored. Owners are restored with `--same-owner`.
 - **Safe extraction.** Paths that would escape the destination folder (`..`, absolute paths, drive letters) are refused, and nothing is ever written through a symlink.
@@ -116,7 +117,7 @@ flowchart TD
     CDC["Content-defined chunking<br/>FastCDC, ~64 KiB chunks, BLAKE3 hash"] --> DD{"Chunk already stored?<br/>(this run or any earlier snapshot)"}
     DD -->|yes| REF["Point to the existing chunk"]
     DD -->|no| GRP["Group by kind, sort by path<br/>into 128 MiB solid blocks"]
-    GRP --> CODEC["Compress blocks in parallel<br/>store · zstd · LZMA2 · LZMA2 + x86 filter,<br/>picked per block"]
+    GRP --> CODEC["Compress blocks in parallel<br/>store · zstd · bsc · LZMA2 · LZMA2 + x86 filter,<br/>picked per block"]
     CODEC --> ENC{"Password?"}
     ENC -->|yes| SEAL["Seal with XChaCha20-Poly1305<br/>key from Argon2id"]
     ENC -->|no| OUT
@@ -164,9 +165,10 @@ What happens to the bytes of an Office file and an edited copy of it:
  │ A │ B │ C │ D │ E │ B' │ E' │ chunks from other text files …      │
  └───┴───┴───┴───┴───┴────┴────┴─────────────────────────────────────┘
     │
-    │ 4. compress the whole block: zstd 19 with long-range matching in
-    │    balanced mode; in max mode, whichever of zstd, LZMA2 and
-    │    LZMA2 + x86 filter wins on samples. Random-looking data is stored.
+    │ 4. compress the whole block: zstd 19 with long-range matching, or
+    │    libbsc (BWT) if a sample shows it clearly smaller; in max mode,
+    │    whichever of zstd, LZMA2, LZMA2 + x86 and bsc wins on samples.
+    │    Random-looking data is stored.
     ▼
  ┌──────────────────────┐
  │ compressed block 7   │
@@ -183,6 +185,7 @@ What happens to the bytes of an Office file and an edited copy of it:
 
 - **Archives only grow.** Each update adds a snapshot; deleting old snapshots to reclaim space isn't supported yet.
 - **Some file metadata isn't kept.** Extended attributes (on macOS: Finder tags, quarantine flags), ACLs and resource forks are not stored. Hard-linked files are restored as separate copies, though their data is only stored once.
+- **Extracting bsc blocks is slower.** Blocks compressed with libbsc decode at about 15–20 MB/s per core, against hundreds of MB/s for zstd. snugly only uses it where it is clearly smaller.
 - **Memory in max mode.** LZMA2 uses about 1–1.5 GB per block being compressed. snugly limits how many blocks it compresses at once to fit in half of your RAM; on a small machine you can also use `-t 1` or `-b 64`.
 - **Large photos need memory to restore.** Restoring a recompressed JPEG needs memory in proportion to its pixel count, up to about 4 GB for the largest image snugly accepts (16,386 × 16,386 pixels). Lower `-t` when extracting to limit how many are restored at once.
 
@@ -229,7 +232,7 @@ Integers in the header and footer are little-endian; integers in the index are v
 
 Index entries in more detail:
 
-- **Blocks:** offset, compressed length, raw length, codec.
+- **Blocks:** offset, compressed length, raw length, codec (0 store, 1 zstd, 2 LZMA2, 3 LZMA2 + x86, 4 bsc).
 - **Chunks:** block, offset, length, BLAKE3.
 - **Snapshots:** time, label, first block added.
 - **Entries:** path, kind (file / dir / symlink), mode, mtime (zigzag seconds + nanoseconds), uid, gid.
@@ -244,13 +247,20 @@ cargo test --release
 
 This runs end-to-end tests covering every mode, metadata, recompression, encryption, snapshots, interrupted updates, repair, hostile paths and corrupted archives.
 
-The `fuzz/` folder has four [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets (`index_decode`, `recomp_inverse`, `archive_verify`, `recovery_index`), with starting inputs in `fuzz/seeds/`:
+The `fuzz/` folder has five [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets (`index_decode`, `block_decode`, `recomp_inverse`, `archive_verify`, `recovery_index`), with starting inputs in `fuzz/seeds/`:
 
 ```
 cargo +nightly fuzz run archive_verify fuzz/corpus/archive_verify fuzz/seeds/archive_verify -- -rss_limit_mb=5000
 ```
 
 The higher memory limit is needed for `archive_verify` and `recomp_inverse`, because a JPEG at the size limit legitimately needs about 4 GB to restore.
+
+To fuzz the vendored C++ (libbsc) with coverage and AddressSanitizer, build it with clang:
+
+```
+CC=clang CXX=clang++ CFLAGS="-fsanitize=fuzzer-no-link,address" CXXFLAGS="-fsanitize=fuzzer-no-link,address" \
+  cargo +nightly fuzz run block_decode fuzz/corpus/block_decode fuzz/seeds/block_decode
+```
 
 Inputs that once caused a crash or hang are kept as regression tests in `tests/fuzz_regressions/`.
 
@@ -278,4 +288,4 @@ It writes sizes, times and peak memory to `bench-out/results.txt`.
 
 [MIT](LICENSE) © 2026 Mushfau Saeed.
 
-`vendor/preflate-rs` is a patched copy of [preflate-rs](https://github.com/microsoft/preflate-rs) (Apache-2.0) and stays under its own license (`vendor/preflate-rs/LICENSE`). The change is described in `vendor/README.md`.
+`vendor/preflate-rs` and `vendor/libbsc` are patched copies of [preflate-rs](https://github.com/microsoft/preflate-rs) and [libbsc](https://github.com/IlyaGrebnov/libbsc) (both Apache-2.0) and stay under their own licenses (`vendor/*/LICENSE`). The changes are described in `vendor/README.md`.

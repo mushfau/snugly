@@ -390,10 +390,10 @@ pub fn create(archive: &Path, input: &Path, o: &Opts) -> Result<()> {
         .collect();
     drop(wtx);
     let mut bw = BufWriter::with_capacity(1 << 20, out.try_clone()?);
-    let writer = thread::spawn(move || -> Result<(u64, Vec<(u32, BlockEntry)>, [usize; 4])> {
+    let writer = thread::spawn(move || -> Result<(u64, Vec<(u32, BlockEntry)>, [usize; 5])> {
         let mut off = start;
         let mut blocks = Vec::new();
-        let mut codec_count = [0usize; 4];
+        let mut codec_count = [0usize; 5];
         for r in wrx {
             let (id, raw_len, codec, bytes) = r?;
             let t = Instant::now();
@@ -514,7 +514,7 @@ pub fn create(archive: &Path, input: &Path, o: &Opts) -> Result<()> {
     let [_, gz, jp, sp] = rstats;
     eprintln!(
         "snapshot #{} {}: {nfiles} files ({}){} | unchanged {reused} ({}) reused without reading | read {} | \
-         dedup matched {} | recompressed {} gzip, {} jpeg, {} zip/png | streamed {streamed} | +{} new blocks [store {} zstd {} xz {} xz+bcj {}] | \
+         dedup matched {} | recompressed {} gzip, {} jpeg, {} zip/png | streamed {streamed} | +{} new blocks [store {} zstd {} bsc {} xz {} xz+bcj {}] | \
          added {} -> archive now {} | {:.2}s",
         index.snapshots.len(),
         if cipher.is_some() { "(encrypted)" } else { "" },
@@ -525,7 +525,7 @@ pub fn create(archive: &Path, input: &Path, o: &Opts) -> Result<()> {
         human(dup_bytes),
         gz.0, jp.0, sp.0,
         index.blocks.len() - first_block as usize,
-        codec_count[0], codec_count[1], codec_count[2], codec_count[3],
+        codec_count[0], codec_count[1], codec_count[4], codec_count[2], codec_count[3],
         human(total - start),
         human(total),
         t0.elapsed().as_secs_f64()
@@ -570,7 +570,7 @@ fn plan_threads(o: &Opts, items: &[Item], block_size: usize) -> ThreadPlan {
     let per_block: u64 = block_size as u64
         + match o.mode {
             Mode::Fast => 64 << 20,
-            Mode::Balanced => 640 << 20,
+            Mode::Balanced => 900 << 20,
             Mode::Max | Mode::Exhaustive => 2400 << 20,
         };
     let mem_cap = total_memory().map(|m| ((m / 2) / per_block).max(1) as usize).unwrap_or(usize::MAX);

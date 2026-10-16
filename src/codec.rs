@@ -96,6 +96,7 @@ fn run_codec(codec: u8, data: &[u8], workers: u32) -> Result<Vec<u8>> {
         CODEC_ZSTD => zstd_compress(data, 22, workers),
         CODEC_XZ => xz_compress(data, false),
         CODEC_XZ_X86 => xz_compress(data, true),
+        CODEC_BSC => crate::bsc::compress(data),
         _ => unreachable!(),
     }
 }
@@ -122,6 +123,7 @@ pub fn decompress(codec: u8, data: Vec<u8>, raw_len: usize) -> Result<Vec<u8>> {
             xz2::read::XzDecoder::new(data).take(raw_len as u64 + 1).read_to_end(&mut v)?;
             v
         }
+        CODEC_BSC => crate::bsc::decompress(data, raw_len)?,
         c => bail!("unknown codec {c}"),
     };
     if out.len() != raw_len {
@@ -129,6 +131,9 @@ pub fn decompress(codec: u8, data: Vec<u8>, raw_len: usize) -> Result<Vec<u8>> {
     }
     Ok(out)
 }
+
+/// bsc must beat zstd -19 by this factor on the sample to be chosen (its decoding is much slower).
+const BSC_MARGIN: f64 = 0.97;
 
 /// Evenly spaced slices of the block, used to predict which codec wins.
 fn sample_of(raw: &[u8]) -> Vec<u8> {
@@ -162,11 +167,28 @@ pub fn compress_block(raw: &[u8], kind: Kind, mode: Mode, workers: u32) -> Resul
         // Media is mostly incompressible, but containers (HEIC/MOV metadata, index tables) still
         // give LZMA a few percent, so only max/exhaustive spend the time on it.
         (Mode::Fast | Mode::Balanced, Kind::Incompressible) | (Mode::Fast, _) => (CODEC_ZSTD, zstd_compress(raw, 3, workers)?),
+        // Text and other binary data: libbsc (BWT) compresses ~10x faster than zstd -19 but
+        // decodes ~20x slower, and only wins on size for some data (prose, XML, databases);
+        // zstd's long-range matching wins on repetitive data such as source trees. Use bsc only
+        // where a sample shows it clearly smaller.
+        (Mode::Balanced, Kind::Text | Kind::Binary) if raw.len() > 12 << 20 => {
+            let s = sample_of(raw);
+            let (b, z) = rayon::join(|| crate::bsc::compress(&s).map(|v| v.len()), || zstd_compress(&s, 19, 1).map(|v| v.len()));
+            match b {
+                Ok(b) if (b as f64) <= z? as f64 * BSC_MARGIN => match crate::bsc::compress(raw) {
+                    Ok(v) => (CODEC_BSC, v),
+                    Err(_) => (CODEC_ZSTD, zstd_compress(raw, 19, workers)?),
+                },
+                _ => (CODEC_ZSTD, zstd_compress(raw, 19, workers)?),
+            }
+        }
         (Mode::Balanced, _) => (CODEC_ZSTD, zstd_compress(raw, 19, workers)?),
         (Mode::Max | Mode::Exhaustive, k) => {
             let mut codecs = vec![CODEC_ZSTD, CODEC_XZ];
             if k == Kind::Executable {
                 codecs.push(CODEC_XZ_X86);
+            } else {
+                codecs.push(CODEC_BSC);
             }
             if mode == Mode::Max && raw.len() > 12 << 20 {
                 // Score each codec on a sample; fully run the winner, plus the

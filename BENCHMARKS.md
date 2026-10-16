@@ -14,19 +14,23 @@ These numbers were measured on pre-release builds while snugly was being develop
 
 Anyone can reproduce this one: `python3 bench/fetch-corpus.py` downloads the same files, checked against their SHA-256 (see the README). It mixes camera photos (26%), executables (17%), text and source code (15%), video (13%), PDFs, Office files, PNGs, HEIC test images and the Silesia corpus. Balanced mode, 2 threads, files already in the disk cache.
 
-| Build | Archive | Create | CPU time | Peak memory |
+| Build | Archive | Create | CPU time | Extract + verify |
 |---|---|---|---|---|
-| Before speed work | 636.0 MB | 295 s | 555 s | 1.9 GB |
-| **Current** | **636.0 MB** | **240 s** | **449 s** | 1.8 GB |
+| Before speed work | 636.0 MB | 295 s | 555 s | 25 s |
+| Faster recompression and threading | 636.0 MB | 240 s | 449 s | 25 s |
+| **Current (adds libbsc)** | **632.7 MB** | **211 s** | **399 s** | 44 s |
 
-Extracting and verifying every file takes 25 s.
+Peak memory is about 2.2 GB when creating and 1.9 GB when extracting.
 
 What changed:
 - Recompressed files used to be verified twice: once by lepton or preflate internally, then again by snugly's own byte-for-byte rebuild. Now only snugly's check runs, and the libraries' own checks are used only as a fallback when it fails. JPEG, ZIP/PNG and gzip recompression each got about twice as fast.
 - When there are fewer blocks than cores, zstd now uses spare cores inside a block. On a single-block folder of source code this cut the time from 50 s to 37 s with 2 threads, at a cost of about 0.1% in size. Large archives, where every core already has a block, are unaffected.
 - The thread count now defaults to all cores, limited by memory, instead of at most 4.
+- Blocks where a sample shows [libbsc](https://github.com/IlyaGrebnov/libbsc)'s Burrows–Wheeler coder at least 3% smaller than zstd now use it. Here that was 3 of 13 blocks: together they came out 3.3 MB (9%) smaller and compressed up to 4x faster. One of the three, a block that compresses to almost nothing either way, ended up 0.1 MB larger because the sample misjudged it. They decode more slowly, which is why extraction went from 25 s to 44 s. libbsc was hardened before use: fuzzing found five out-of-bounds bugs in its decoder, all fixed (see `vendor/README.md`).
 
-`--stats` shows where the time goes. On this machine about three quarters of the CPU time is zstd level 19, and most of the rest is JPEG and deflate recompression.
+Where libbsc wins, it wins big. On a 119 MB block of prose and XML from Silesia, it produced 15.6 MB against zstd -19's 18.7 MB (17% smaller) in 6.7 s instead of 71 s. On source code, where zstd's long-range matching finds repeats across files, zstd stays smaller, so snugly keeps using it.
+
+`--stats` shows where the time goes. Most of the CPU time is now zstd level 19 on code and executables, then JPEG and deflate recompression.
 
 ## Photos
 
